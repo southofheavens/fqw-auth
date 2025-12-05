@@ -12,6 +12,9 @@
 #include <Poco/JSON/Object.h>
 #include <Poco/URI.h>
 
+namespace Auth::Handlers
+{
+
 namespace
 {
 
@@ -28,15 +31,12 @@ void sendJsonResponse(Poco::Net::HTTPServerResponse& res,
 
 } // namespace
 
-namespace Auth::Handlers
-{
-
 LoginHandler::LoginHandler(Poco::Data::SessionPool& sessionPool) : sessionPool_{sessionPool} {}
 
 void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::HTTPServerResponse& res)
-// TODO добавить проверку на то, что для данного юзера еще не существует токенов. если существуют, то их и возвращаем пользователю.
-// если рефреш есть а аккесса нет - создаем аккесс а рефреш нет
-// если аккесс есть а рефреша нет - то хз пока че, мне лень думать
+// TODO Нужно проверять лимит рефреш токенов на пользователя. Пусть лимитом будет 5. Если лимит исчерпан, то
+// мы удаляем самый старый токен (который создан раньше всех) и добавляем новый, который будем сейчас возвращать
+// пользователю после его создания
 {
     try
     {
