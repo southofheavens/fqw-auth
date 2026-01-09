@@ -3,7 +3,9 @@
 
 #include <Handlers.h>
 #include <Utils.h>
+#include <fqw-devkit/lib/Tokens.h>
 
+#include <sodium.h>
 #include <Poco/Data/Session.h>
 #include <Poco/Data/RecordSet.h>
 #include <Poco/Data/Statement.h>
@@ -11,10 +13,19 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/URI.h>
+#include <Poco/JWT/JWT.h>
+#include <Poco/JWT/Signer.h>
+#include <Poco/JWT/Token.h>
+#include <Poco/Timestamp.h>
+#include <Poco/UUID.h>
+#include <Poco/UUIDGenerator.h>
 
 namespace FQW::Auth::Handlers
 {
 
+/**
+ * Вспомогательные функции
+ */
 namespace
 {
 
@@ -29,9 +40,87 @@ void sendJsonResponse(Poco::Net::HTTPServerResponse& res,
     json.stringify(out);
 }
 
+/**
+ * @brief Хэширует пароль используя Argon2 алгоритм
+ * @param password Пароль для хэширования
+ * @return std::string Хэшированный пароль в формате libsodium
+ * @throw std::runtime_error если хэширование не удалось
+ */
+std::string hashPassword(const std::string& password)
+{
+    char hashed[crypto_pwhash_STRBYTES];
+    
+    if (crypto_pwhash_str(hashed, password.c_str(), password.length(), 
+        crypto_pwhash_OPSLIMIT_MODERATE, crypto_pwhash_MEMLIMIT_MODERATE) != 0) 
+    { 
+        throw std::runtime_error("Password hashing failed - possibly out of memory");
+    }
+    
+    return std::string(hashed);
+}
+
+/**
+ * @brief Сравнивает пароль с хэшем
+ * @param password Пароль для проверки
+ * @param hash Хэш из базы данных
+ * @return bool true если пароль верный, false если неверный
+ * @throw std::runtime_error если проверка не удалась (системная ошибка)
+ */
+bool verifyPassword(const std::string& password, const std::string& hash)
+{    
+    int result = crypto_pwhash_str_verify(hash.c_str(), password.c_str(), password.length());
+    
+    if (result == 0) {
+        return true;
+    } 
+    else if (result == -1) {
+        return false;
+    } 
+    else {
+        throw std::runtime_error("Password verification system error");
+    }
+}
+
+const std::string key_ = "secret_key";
+
+/**
+ * @brief Генерирует access токен, который представляет из себя JWT
+ * @param p Полезная нагрузка
+ * @return Токен
+ */
+std::string createAccessToken(const FQW::Devkit::Tokens::Payload& p)
+{
+    Poco::JWT::Token token;
+
+    token.setSubject(std::to_string(p.sub));
+
+    token.payload().set("role", p.role);
+
+    Poco::Timestamp expires = static_cast<Poco::Timestamp::TimeVal>(
+        std::chrono::duration_cast<std::chrono::microseconds>(p.exp).count()
+    );
+    token.setExpiration(expires);
+    
+    Poco::JWT::Signer signer(key_);
+    return signer.sign(token, Poco::JWT::Signer::ALGO_HS256);
+}
+
+/**
+ * @brief Генерирует refresh токен, представляющий из себя UUID
+ * @return Токен
+ */
+std::string createRefreshToken()
+{
+    Poco::UUID uuid = Poco::UUIDGenerator::defaultGenerator().createRandom();
+    return uuid.toString();
+}
+
 } // namespace
 
-LoginHandler::LoginHandler(Poco::Data::SessionPool& sessionPool) : sessionPool_{sessionPool} {}
+
+
+LoginHandler::LoginHandler(Poco::Data::SessionPool& sessionPool, Poco::Redis::Client & redisClient) 
+    : sessionPool_{sessionPool}, redisClient_{redisClient} {}
 
 void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::HTTPServerResponse& res)
 // TODO Нужно проверять лимит рефреш токенов на пользователя. Пусть лимитом будет 5. Если лимит исчерпан, то
@@ -77,11 +166,11 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         if (jsonObject->size() != pairs.size())
         {
             res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-            sendJsonResponse(res, "error", "Expected to receive a login and password, but received more pairs");
+            sendJsonResponse(res, "error", "Expected to receive a login and password, Incorrect number of pairs received");
             return;
         }
 
-        for (auto& [key, value] : pairs)
+        for (auto & [key, value] : pairs)
         {
             if (not jsonObject->has(key)) 
             {
@@ -98,7 +187,7 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
          */
         Poco::Data::Session session = sessionPool_.get();
         Poco::Data::Statement stmt(session);
-         
+            
         std::string hashedPassword, userRole;
         uint64_t userId;
         stmt << "SELECT password, role, id FROM users WHERE login = $1",
@@ -111,7 +200,7 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
             throw Poco::Exception("Incorrect login or password");
         }
 
-        if (not Auth::Utils::verifyPassword(pairs["password"].toString(), hashedPassword)) {
+        if (not Auth::Handlers::verifyPassword(pairs["password"].toString(), hashedPassword)) {
             throw Poco::Exception("Incorrect login or password"); 
         }
 
@@ -129,19 +218,19 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         /**
          * Генерируем access и refresh токены
          */
-        std::string accessToken = Auth::Utils::createAccessToken(jwtPayload);
-        std::string refreshToken = Auth::Utils::createRefreshToken();
+        std::string accessToken = Auth::Handlers::createAccessToken(jwtPayload);
+        std::string refreshToken = Auth::Handlers::createRefreshToken();
 
         /**
          * Формируем lookup_key 
          */
-        std::string lookup_key = refreshToken.substr(0,Auth::Utils::lookup_key_length);
+        std::string lookup_key = refreshToken.substr(0, Auth::Utils::lookup_key_length);
 
         stmt.reset();
 
         uint64_t expires = std::chrono::duration_cast<std::chrono::seconds>((std::chrono::system_clock::now() + 
             Auth::Utils::refresh_token_validity_period).time_since_epoch()).count();
-        std::string hashedRefreshToken = Auth::Utils::hashPassword(refreshToken);
+        std::string hashedRefreshToken = Auth::Handlers::hashPassword(refreshToken);
         stmt << "INSERT INTO refresh_tokens (user_id, lookup_key, token, expires)"
             << "VALUES ($1, $2, $3, $4)",
             Poco::Data::Keywords::use(userId),
@@ -154,25 +243,21 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         Poco::JSON::Object resultJson;
         resultJson.set("access_token", accessToken);
         resultJson.set("refresh_token", refreshToken);
+
+        Poco::Net::HTTPCookie cookie("refreshToken", refreshToken);
+        cookie.setHttpOnly(true);
+        cookie.setSecure(true);
+        cookie.setPath("/"); // TODO наверное не стоит делать /
+        cookie.setSameSite(Poco::Net::HTTPCookie::SAME_SITE_STRICT);
+
+        res.addCookie(cookie);
+
         resultJson.stringify(res.send());
-    }
-    catch (const Poco::Exception& e)
-    {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-        sendJsonResponse(res, "error", e.displayText());
-        return;
-    }
-    catch (const std::exception& e)
-    {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-        sendJsonResponse(res, "error", e.what());
-        return;
     }
     catch (...)
     {
         res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
-        sendJsonResponse(res, "error", "Unknown internal server error");
-        return;
+        sendJsonResponse(res, "error", "error");
     }
 }
 
@@ -244,7 +329,7 @@ void RegisterHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net
 
         // Здесь можно автоматизировать. Тогда в случае изменения структуры бд необходимо будет
         // только в pairs добавить новый элемент и всё
-        std::string hashedPassword = Auth::Utils::hashPassword(pairs["password"].toString());
+        std::string hashedPassword = Auth::Handlers::hashPassword(pairs["password"].toString());
         stmt << "INSERT INTO users (name, surname, role, login, password)"
             << "VALUES ($1, $2, $3 , $4, $5)",
             Poco::Data::Keywords::use(pairs["name"]),
@@ -255,6 +340,67 @@ void RegisterHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net
         stmt.execute();
 
         sendJsonResponse(res, "OK", "OK");
+    }
+    catch (const Poco::Exception& e)
+    {
+        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        sendJsonResponse(res, "error", e.displayText());
+        return;
+    }
+    catch (const std::exception& e)
+    {
+        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        sendJsonResponse(res, "error", e.what());
+        return;
+    }
+    catch (...)
+    {
+        res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+        sendJsonResponse(res, "error", "Unknown internal server error");
+        return;
+    }
+}
+
+RefreshHandler::RefreshHandler(Poco::Data::SessionPool & sessionPool, Poco::Redis::Client & redisClient) 
+    : sessionPool_{sessionPool}, redisClient_{redisClient} {}
+
+void RefreshHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::HTTPServerResponse& res) 
+{
+    try
+    {
+        if (req.getContentType().find("application/json") == std::string::npos) {
+            throw Poco::Exception("Content-Type must be application/json");
+        }
+
+        /**
+         * Пробуем получить refresh token из куки
+         */
+        Poco::Net::NameValueCollection cookies;
+        req.getCookies(cookies); 
+
+        std::string refreshToken = cookies["refreshToken"]; 
+
+        if (refreshToken.empty())
+        {
+            std::string jsonBody;
+            Poco::StreamCopier::copyToString(req.stream(), jsonBody);
+            
+            Poco::JSON::Parser parser;
+            Poco::Dynamic::Var result = parser.parse(jsonBody);
+            Poco::JSON::Object::Ptr jsonObject = result.extract<Poco::JSON::Object::Ptr>();
+            
+            if (not jsonObject->has("refreshToken")) {
+                throw Poco::Exception("There is no refresh token in the cookie/request body");
+            }
+
+            refreshToken = (jsonObject->get("refreshToken")).convert<std::string>();
+        }
+        
+
+        // Ищем в бд данный рефреш токен
+        // Найдено - удаляем его из БД, берем из таблицы users роль пользователя и формируем новый access
+        // Формируем новый refresh
+        // Возвращаем access и refresh
     }
     catch (const Poco::Exception& e)
     {

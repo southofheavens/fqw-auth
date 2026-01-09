@@ -14,6 +14,7 @@ poco_json = cpp.find_library('PocoJSON', required: true)
 poco_data = cpp.find_library('PocoData', required: false) 
 poco_data_postgresql = cpp.find_library('PocoDataPostgreSQL', required: false)
 poco_jwt = cpp.find_library('PocoJWT', required: true)
+poco_redis = cpp.find_library('PocoRedis', required: true)
 
 pq = cpp.find_library('pq', required: true)
 sodium = cpp.find_library('sodium', required: true)
@@ -26,6 +27,7 @@ all_deps = [
   poco_net,
   poco_json,
   poco_jwt,
+  poco_redis,
   pq,
   sodium,
   ssl,
