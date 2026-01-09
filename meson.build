@@ -58,7 +58,7 @@ executable('fqw-auth',
   src_files,
   include_directories: include_dirs,
   dependencies: all_deps,
-  cpp_args: ['-std=c++17']
+  cpp_args: ['-std=c++20']
 )
 
 # DYLD_LIBRARY_PATH=/usr/local/lib ./build/fqw-auth

@@ -1,4 +1,5 @@
 #include <iostream>
+#include <format>
 #include <unordered_set>
 
 #include <Handlers.h>
@@ -19,15 +20,19 @@
 #include <Poco/Timestamp.h>
 #include <Poco/UUID.h>
 #include <Poco/UUIDGenerator.h>
+#include <Poco/SHA2Engine.h>
+#include <Poco/DigestStream.h>
+#include <Poco/Redis/Command.h>
 
 namespace FQW::Auth::Handlers
 {
 
-/**
- * Вспомогательные функции
- */
 namespace
 {
+
+const std::string key_ = "secret_key";
+constexpr std::chrono::seconds access_token_validity_period = std::chrono::seconds(15 * 60);
+constexpr std::chrono::seconds refresh_token_validity_period = std::chrono::seconds(30 * 24 * 60 * 60);
 
 void sendJsonResponse(Poco::Net::HTTPServerResponse& res,
     const std::string& status, const std::string& message)
@@ -81,8 +86,6 @@ bool verifyPassword(const std::string& password, const std::string& hash)
     }
 }
 
-const std::string key_ = "secret_key";
-
 /**
  * @brief Генерирует access токен, который представляет из себя JWT
  * @param p Полезная нагрузка
@@ -115,6 +118,30 @@ std::string createRefreshToken()
     return uuid.toString();
 }
 
+std::string hashRefreshToken(const std::string & token)
+{
+    Poco::SHA2Engine sha256(Poco::SHA2Engine::SHA_256);
+
+    sha256.update(token);
+
+    const Poco::DigestEngine::Digest & digest = sha256.digest();
+
+    return Poco::DigestEngine::digestToHex(digest);
+}
+
+bool verifyRefreshToken(const std::string & token, const std::string & hash)
+{
+    Poco::SHA2Engine sha256(Poco::SHA2Engine::SHA_256);
+
+    sha256.update(token);
+
+    const Poco::DigestEngine::Digest & digest = sha256.digest();
+
+    std::string hex_token = Poco::DigestEngine::digestToHex(digest);
+
+    return (hex_token == hash);
+}
+
 } // namespace
 
 
@@ -126,6 +153,10 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
 // TODO Нужно проверять лимит рефреш токенов на пользователя. Пусть лимитом будет 5. Если лимит исчерпан, то
 // мы удаляем самый старый токен (который создан раньше всех) и добавляем новый, который будем сейчас возвращать
 // пользователю после его создания
+
+/**
+ * 
+ */
 {
     try
     {
@@ -163,19 +194,12 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
             {"password", {}}
         };
 
-        if (jsonObject->size() != pairs.size())
-        {
-            res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-            sendJsonResponse(res, "error", "Expected to receive a login and password, Incorrect number of pairs received");
-            return;
-        }
-
         for (auto & [key, value] : pairs)
         {
             if (not jsonObject->has(key)) 
             {
                 res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-                sendJsonResponse(res, "error", "Unknown name of field");
+                sendJsonResponse(res, "error", std::format("Field {} was not received", key));
                 return;
             }
             value = jsonObject->get(key);
@@ -212,7 +236,7 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
             .sub = userId,
             .role = userRole,
             .exp = std::chrono::duration_cast<std::chrono::seconds>((std::chrono::system_clock::now() + 
-                Auth::Utils::access_token_validity_period).time_since_epoch())
+                Auth::Handlers::access_token_validity_period).time_since_epoch())
         };
 
         /**
@@ -222,29 +246,45 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         std::string refreshToken = Auth::Handlers::createRefreshToken();
 
         /**
-         * Формируем lookup_key 
+         * Помещаем refresh в Redis
          */
-        std::string lookup_key = refreshToken.substr(0, Auth::Utils::lookup_key_length);
 
-        stmt.reset();
+        /* ua читаем только из заголовка */
+        std::string userAgent = req.get("User-Agent", "");
 
-        uint64_t expires = std::chrono::duration_cast<std::chrono::seconds>((std::chrono::system_clock::now() + 
-            Auth::Utils::refresh_token_validity_period).time_since_epoch()).count();
-        std::string hashedRefreshToken = Auth::Handlers::hashPassword(refreshToken);
-        stmt << "INSERT INTO refresh_tokens (user_id, lookup_key, token, expires)"
-            << "VALUES ($1, $2, $3, $4)",
-            Poco::Data::Keywords::use(userId),
-            Poco::Data::Keywords::use(lookup_key),
-            Poco::Data::Keywords::use(hashedRefreshToken),
-            Poco::Data::Keywords::use(expires);
+        /* если заголовок Fingerprint пуст, пытаемся считать fingerprint из тела запроса */
+        std::string fingerprint = req.get("X-Fingerprint", "");
+        if (fingerprint.empty())
+        {
+            if (jsonObject->has("fingerprint")) {
+                fingerprint = (jsonObject->get("fingerprint")).extract<std::string>();
+            }
+        }
+
+        /* если заголовок X-Forwarded-For пуст, то берём IP напрямую из сокета */
+        std::string ipAddress = req.get("X-Forwarded-For", "");
+        if (not ipAddress.empty())
+        {
+            size_t comma = ipAddress.find(",");
+            if (comma != std::string::npos) {
+                ipAddress = ipAddress.substr(0, comma);
+            }
+        }
+        else {
+            ipAddress = req.clientAddress().host().toString();
+        }
+
+        // 1. если рефрешей стало 5, удаляем самый старый
+        // 2. добавляем новый рефреш в rtk:
+        // 3. добавляем новый рефреш в user_rtk:
         
-        stmt.execute();
+       
 
         Poco::JSON::Object resultJson;
         resultJson.set("access_token", accessToken);
         resultJson.set("refresh_token", refreshToken);
 
-        Poco::Net::HTTPCookie cookie("refreshToken", refreshToken);
+        Poco::Net::HTTPCookie cookie("refresh_token", refreshToken);
         cookie.setHttpOnly(true);
         cookie.setSecure(true);
         cookie.setPath("/"); // TODO наверное не стоит делать /
