@@ -1,6 +1,7 @@
 #include <iostream>
 #include <format>
 #include <unordered_set>
+#include <chrono>
 
 #include <Handlers.h>
 #include <Utils.h>
@@ -162,14 +163,14 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
     {
         if (req.getContentType().find("application/json") == std::string::npos) 
         {
-            res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
             sendJsonResponse(res, "error", "Content-Type must be application/json");
             return;
         }
 
         if (req.getContentLength() == 0) 
         {
-            res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
             sendJsonResponse(res, "error", "Empty request body");
             return;
         }
@@ -182,7 +183,7 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
 
         if (result.type() != typeid(Poco::JSON::Object::Ptr)) 
         {
-            res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
             sendJsonResponse(res, "error", "Expected JSON object, not array");
             return;
         }
@@ -198,7 +199,7 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         {
             if (not jsonObject->has(key)) 
             {
-                res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+                res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
                 sendJsonResponse(res, "error", std::format("Field {} was not received", key));
                 return;
             }
@@ -251,6 +252,12 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
 
         /* ua читаем только из заголовка */
         std::string userAgent = req.get("User-Agent", "");
+        if (userAgent.empty())
+        {
+            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+            sendJsonResponse(res, "error", "User-Agent title is missing or empty");
+            return;
+        }
 
         /* если заголовок Fingerprint пуст, пытаемся считать fingerprint из тела запроса */
         std::string fingerprint = req.get("X-Fingerprint", "");
@@ -258,6 +265,13 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         {
             if (jsonObject->has("fingerprint")) {
                 fingerprint = (jsonObject->get("fingerprint")).extract<std::string>();
+            }
+            else
+            {
+                res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+                sendJsonResponse(res, "error", "The fingerprint was expected to be received via the 'X-Fingerprint' header "
+                    "or in the request body as the 'fingerprint' parameter");
+                return;
             }
         }
 
@@ -277,8 +291,29 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
         // 1. если рефрешей стало 5, удаляем самый старый
         // 2. добавляем новый рефреш в rtk:
         // 3. добавляем новый рефреш в user_rtk:
+
+        Poco::Redis::Array cmd;
+        cmd << "ZCARD" << std::format("user_rtk:{}", userId);
+        Poco::Int64 resultOfCmd = redisClient_.execute<Poco::Int64>(cmd);
+        if (resultOfCmd == 5)
+        /* Удаляем самый старый refresh-токен */
+        {
+            cmd.clear();
+            cmd << "ZPOPMIN" << std::format("user_rtk:{}", userId);
+            Poco::Redis::Array resultOfPop = redisClient_.execute<Poco::Redis::Array>(cmd);
+        }
+
+        std::string hashedRefresh = hashRefreshToken(refreshToken);
+        cmd.clear();
+        cmd << "HSET" << std::format("rtk:{}", hashedRefresh) << "ua" << userAgent
+            << "fingerprint" << fingerprint << "ip" << ipAddress
+            << "created" << std::to_string(
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now()
+            .time_since_epoch()).count());
+        resultOfCmd = redisClient_.execute<Poco::Int64>(cmd);
+
+        /* задать время исчезновения объекта expired */
         
-       
 
         Poco::JSON::Object resultJson;
         resultJson.set("access_token", accessToken);
@@ -296,7 +331,7 @@ void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::H
     }
     catch (...)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
         sendJsonResponse(res, "error", "error");
     }
 }
@@ -383,19 +418,19 @@ void RegisterHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net
     }
     catch (const Poco::Exception& e)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
         sendJsonResponse(res, "error", e.displayText());
         return;
     }
     catch (const std::exception& e)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
         sendJsonResponse(res, "error", e.what());
         return;
     }
     catch (...)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
         sendJsonResponse(res, "error", "Unknown internal server error");
         return;
     }
@@ -444,19 +479,19 @@ void RefreshHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net:
     }
     catch (const Poco::Exception& e)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
         sendJsonResponse(res, "error", e.displayText());
         return;
     }
     catch (const std::exception& e)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
         sendJsonResponse(res, "error", e.what());
         return;
     }
     catch (...)
     {
-        res.setStatus(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
         sendJsonResponse(res, "error", "Unknown internal server error");
         return;
     }
