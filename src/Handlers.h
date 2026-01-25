@@ -19,7 +19,7 @@ public:
     LoginHandler(Poco::Data::SessionPool & sessionPool, Poco::Redis::Client & redisClient);
 
 private:
-    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) override;
+    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) final;
 
 private:
     Poco::Data::SessionPool & sessionPool_;
@@ -35,7 +35,7 @@ public:
     RegisterHandler(Poco::Data::SessionPool & sessionPool);
 
 private:
-    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) override;
+    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) final;
 
 private:
     Poco::Data::SessionPool & sessionPool_;
@@ -50,7 +50,7 @@ public:
     RefreshHandler(Poco::Data::SessionPool & sessionPool, Poco::Redis::Client & redisClient);
 
 private:
-    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) override;
+    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) final;
 
 private:
     Poco::Data::SessionPool & sessionPool_;
@@ -66,7 +66,7 @@ public:
     ErrorHandler() = default;
 
 private:
-    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) override;
+    void handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) final;
 };
 
 } // namespace FQW::Auth::Handlers
