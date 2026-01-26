@@ -33,13 +33,17 @@ namespace
 {
 
 // Лимит refresh-токенов на одного пользователя
-constexpr uint8_t              refresh_tokens_limit          = 5;
+constexpr uint8_t                refresh_tokens_limit          = 5;
 // Время действия access-токена
-constexpr std::chrono::seconds access_token_validity_period  = std::chrono::seconds(15 * 60);
+constexpr std::chrono::seconds   access_token_validity_period  = std::chrono::seconds(15 * 60);
 // Время действия refresh-токена
-constexpr std::chrono::seconds refresh_token_validity_period = std::chrono::seconds(30 * 24 * 60 * 60);
+constexpr std::chrono::seconds   refresh_token_validity_period = std::chrono::seconds(30 * 24 * 60 * 60);
 // Секретный ключ для подписи 
-const     std::string          key_                          = "secret_key";
+const     std::string            key                           = "secret_key";
+// 
+const std::array<std::string, 2> userRoles = {"Participant", "Judge"};
+ 
+
 
 // Declarations
 
@@ -152,9 +156,9 @@ Poco::JSON::Object::Ptr extractJsonObjectFromRequest(Poco::Net::HTTPServerReques
 // Считывает lua-script из файла с именем filename и возвращает его
 std::string readLuaScript(const std::string & filename);
 
-// Проверяет, есть ли для данных fingerprint и UA refresh-токен. Если да, то возвращает его.
+// Проверяет, есть ли для данных fingerprint и UA refresh-токен. Если да, то возвращает его хэш.
 // В противном случае возвращает std::nullopt 
-std::optional<std::string> getRefreshTokenByUserData(Poco::Redis::Client & redisClient, uint64_t userId,
+std::optional<std::string> getHashRefreshTokenByUserData(Poco::Redis::Client & redisClient, uint64_t userId,
     std::string & fingerprint, std::string & userAgent);
 
 
@@ -229,7 +233,7 @@ std::string createAccessToken(const FQW::Devkit::Tokens::Payload& p)
     );
     token.setExpiration(expires);
     
-    Poco::JWT::Signer signer(key_);
+    Poco::JWT::Signer signer(key);
     return signer.sign(token, Poco::JWT::Signer::ALGO_HS256);
 }
 
@@ -310,7 +314,7 @@ void addRefreshToRedis(Poco::Redis::Client & redisClient, std::string & refreshT
     try {
         redisClient.execute<Poco::Int64>(cmd);
     } 
-    catch (const Poco::Exception & ex) {
+    catch (...) {
         throw HandlersException("Internal server error. Try repeating the request.",
             Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
     }
@@ -395,10 +399,32 @@ std::string readLuaScript(const std::string & filename)
     );
 }
 
-std::optional<std::string> getRefreshTokenByUserData(Poco::Redis::Client & redisClient, uint64_t userId,
+std::optional<std::string> getHashRefreshTokenByUserData(Poco::Redis::Client & redisClient, uint64_t userId,
     std::string & fingerprint, std::string & userAgent)
 {
-    // TODO
+    static const std::string script = readLuaScript("lua_scripts/get_refresh_token_hash.lua");
+
+    Poco::Redis::Array cmd;
+
+    cmd << "EVAL"
+        << script
+        << "1"  
+        << std::format("user_rtk:{}", userId)    // KEYS[1]
+        << fingerprint    // ARGV[1]
+        << userAgent;     // ARGV[2]
+
+    try 
+    {
+        Poco::Redis::BulkString result = redisClient.execute<Poco::Redis::BulkString>(cmd);
+        if (result.isNull()) {
+            return std::nullopt;
+        }
+        return result.value();
+    } 
+    catch (...) {
+        throw HandlersException("Internal server error. Try repeating the request.",
+            Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+    }
 }
 
 } // namespace
@@ -409,7 +435,6 @@ LoginHandler::LoginHandler(Poco::Data::SessionPool & sessionPool, Poco::Redis::C
     : sessionPool_{sessionPool}, redisClient_{redisClient} {}
 
 void LoginHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::HTTPServerResponse& res)
-// нужна проверка. если у пользователя уже есть рефреш для данного ua и fingerprint, то надо вернуть его
 try
 {
     if (req.getContentType().find("application/json") == std::string::npos) {
@@ -474,6 +499,17 @@ try
         throw HandlersException("Incorrect login or password", Poco::Net::HTTPResponse::HTTPStatus::HTTP_BAD_REQUEST);
     }
 
+    /* Проверяем, существует ли для данных UA и fingerprint refresh-токен */
+    if (std::optional<std::string> potentionalRefreshHash
+            = getHashRefreshTokenByUserData(redisClient_, userId, fingerprint, userAgent);
+        potentionalRefreshHash.has_value()) 
+    {
+        // Удаляем хэш refresh-токена из Redis (т.к. дальше для данных UA и fingerprint
+        // будет создан новый refresh-токен, а уже существующий мы не можем использовать
+        // потому, что в Redis хранится хэш, а не сам токен)
+        deleteRefreshFromRedis(redisClient_, potentionalRefreshHash.value(), userId);
+    }
+
     /**
      * Формируем полезную нагрузку для access-токена
      */
@@ -485,20 +521,9 @@ try
             Auth::Handlers::access_token_validity_period).time_since_epoch())
     };
 
-    /* Генерируем access токен */
+    /* Генерируем access и refresh токены */
     std::string accessToken = Auth::Handlers::createAccessToken(jwtPayload);
-
-    /* Проверяем, существует ли для данных UA и fingerprint refresh-токен */
-    std::string refreshToken;
-    if (std::optional<std::string> potentionalRefresh 
-            = getRefreshTokenByUserData(redisClient_, userId, fingerprint, userAgent);
-        potentionalRefresh.has_value()) 
-    {
-        refreshToken = potentionalRefresh.value();
-    }
-    else {
-        std::string refreshToken = Auth::Handlers::createRefreshToken();;
-    }
+    std::string refreshToken = Auth::Handlers::createRefreshToken();
 
     Auth::Handlers::addRefreshToRedis(redisClient_, refreshToken, userId, fingerprint, userAgent);
 
@@ -555,7 +580,11 @@ try
 
     fillRequiredFieldsFromJson(jsonObject, clientContext);
 
-    // проверить роль пользователя
+    std::string stringRole = clientContext["role"].extract<std::string>();
+    if (stringRole != userRoles[0] or stringRole != userRoles[1]) {
+        throw HandlersException(std::format("Invalid role. Correct roles is 'Participant' and 'Judge'"), 
+            Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+    }
 
     Poco::Data::Session session = sessionPool_.get();
 
@@ -601,193 +630,146 @@ catch (...)
 RefreshHandler::RefreshHandler(Poco::Data::SessionPool & sessionPool, Poco::Redis::Client & redisClient) 
     : sessionPool_{sessionPool}, redisClient_{redisClient} {}
 
-void RefreshHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::HTTPServerResponse& res) 
+void RefreshHandler::handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res) 
+try
 {
-    try
+    // Пробуем получить refresh token из куки
+    Poco::Net::NameValueCollection cookies;
+    req.getCookies(cookies); 
+
+    std::string refreshToken;
+    try {
+        refreshToken = cookies["X-Refresh-token"]; 
+    }
+    catch (Poco::Exception & e)
     {
-        /**
-         * Пробуем получить refresh token из куки
-         */
-        Poco::Net::NameValueCollection cookies;
-        req.getCookies(cookies); 
-
-        std::string refreshToken;
-        try {
-            refreshToken = cookies["X-Refresh-token"]; 
-        }
-        catch (Poco::Exception & e)
-        {
-            if (req.getContentType().find("application/json") == std::string::npos) {
-                throw Poco::Exception("Content-Type must be application/json");
-            }
-
-            std::string jsonBody;
-            Poco::StreamCopier::copyToString(req.stream(), jsonBody);
-            
-            Poco::JSON::Parser parser;
-            Poco::Dynamic::Var result = parser.parse(jsonBody);
-            Poco::JSON::Object::Ptr jsonObject = result.extract<Poco::JSON::Object::Ptr>();
-            
-            if (not jsonObject->has("refresh_token")) {
-                throw Poco::Exception("There is no refresh token in the cookie/request body");
-            }
-
-            refreshToken = (jsonObject->get("refresh_token")).convert<std::string>();
+        if (req.getContentType().find("application/json") == std::string::npos) {
+            throw Auth::Handlers::HandlersException("Content-Type must be application/json",
+                Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
         }
 
-        /* ua читаем только из заголовка */
-        std::string userAgent = req.get("User-Agent", "");
-        if (userAgent.empty())
-        {
-            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-            sendJsonResponse(res, "error", "User-Agent title is missing or empty");
-            return;
-        }
-
-        /* Если заголовок Fingerprint пуст, пытаемся считать fingerprint из тела запроса */
-        std::string fingerprint = req.get("X-Fingerprint", "");
-        if (fingerprint.empty())
-        {
-            if (req.getContentType().find("application/json") == std::string::npos) {
-                throw Poco::Exception("Content-Type must be application/json");
-            }
-
-            if (req.getContentLength() == 0) 
-            {
-                res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-                sendJsonResponse(res, "error", "The fingerprint was expected to be received via the 'X-Fingerprint' header "
-                    "or in the request body as the 'fingerprint' parameter");
-                return;
-            }
-
-            std::string jsonBody;
-            Poco::StreamCopier::copyToString(req.stream(), jsonBody);
-            
-            Poco::JSON::Parser parser;
-            Poco::Dynamic::Var result = parser.parse(jsonBody);
-
-            if (result.type() != typeid(Poco::JSON::Object::Ptr)) 
-            {
-                res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-                sendJsonResponse(res, "error", "Expected JSON object, not array");
-                return;
-            }
-
-            Poco::JSON::Object::Ptr jsonObject = result.extract<Poco::JSON::Object::Ptr>();
-
-            if (jsonObject->has("fingerprint")) {
-                fingerprint = (jsonObject->get("fingerprint")).extract<std::string>();
-            }
-            else
-            {
-                res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-                sendJsonResponse(res, "error", "The fingerprint was expected to be received via the 'X-Fingerprint' header "
-                    "or in the request body as the 'fingerprint' parameter");
-                return;
-            }
-        }
+        std::string jsonBody;
+        Poco::StreamCopier::copyToString(req.stream(), jsonBody);
         
-        std::string hashedRefreshToken = hashRefreshToken(refreshToken);
-
-        Poco::Redis::Array cmd;
-        cmd << "EXISTS" << std::format("rtk:{}", hashedRefreshToken);
-        Poco::Int64 int64ResultOfCmd = redisClient_.execute<Poco::Int64>(cmd);
-
-        if (int64ResultOfCmd == 0)
-        {
-            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-            sendJsonResponse(res, "error", "Bad refresh-token");
-            return;
-        }
-
-        // Сравниваем ua и fingerprint
-        cmd.clear();
-        cmd << "HMGET" << std::format("rtk:{}", hashedRefreshToken) << "fingerprint" << "ua" << "user_id";
-        Poco::Redis::Array rtkFileds = redisClient_.execute<Poco::Redis::Array>(cmd);
-
-        // Удаляем hash refresh-токена из ZSET и HSET
-        Poco::UInt64 userId = std::stoull(rtkFileds.get<Poco::Redis::BulkString>(2).value());
-        deleteRefreshFromRedis(redisClient_, hashedRefreshToken, userId);
+        Poco::JSON::Parser parser;
+        Poco::Dynamic::Var result = parser.parse(jsonBody);
+        Poco::JSON::Object::Ptr jsonObject = result.extract<Poco::JSON::Object::Ptr>();
         
-        if (rtkFileds.get<Poco::Redis::BulkString>(0).value() != fingerprint
-            or rtkFileds.get<Poco::Redis::BulkString>(1).value() != userAgent) 
-        {
-            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_FORBIDDEN);
-            sendJsonResponse(res, "error", "Refresh token used from unauthorized device");
-            return;
+        if (not jsonObject->has("refresh_token")) {
+            throw Auth::Handlers::HandlersException("Expected to receive refresh token "
+                "in the cookie/request body",
+                Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
         }
 
-        Poco::Data::Session session = sessionPool_.get();
-        Poco::Data::Statement stmt(session);
-            
-        std::string userRole;
-        stmt << "SELECT role FROM users WHERE id = $1",
-            Poco::Data::Keywords::use(userId),
-            Poco::Data::Keywords::into(userRole);
+        refreshToken = (jsonObject->get("refresh_token")).convert<std::string>();
+    }
+
+    /* ua читаем только из заголовка */
+    if (not req.has("User-Agent")) {
+        throw HandlersException(std::format("User-Agent header was not received"), 
+            Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+    }
+    std::string userAgent = req.get("User-Agent");
+
+    /* Если заголовок Fingerprint пуст, пытаемся считать fingerprint из тела запроса */
+    Poco::JSON::Object::Ptr jsonObject = Auth::Handlers::extractJsonObjectFromRequest(req);
+    std::string fingerprint;
+    if (not req.has("X-Fingerprint"))
+    {
+        if (not jsonObject->has("fingerprint")) {
+            throw HandlersException(std::format("Expected fingerprint from json body or X-Fingerprint header"), 
+                Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+        }
+        fingerprint = (jsonObject->get("fingerprint")).extract<std::string>();
+    }
+    else {
+        fingerprint = req.get("X-Fingerprint");
+    }
+    
+    std::string hashedRefreshToken = Auth::Handlers::hashRefreshToken(refreshToken);
+
+    Poco::Redis::Array cmd;
+    cmd << "EXISTS" << std::format("rtk:{}", hashedRefreshToken);
+    Poco::Int64 int64ResultOfCmd = redisClient_.execute<Poco::Int64>(cmd);
+
+    if (int64ResultOfCmd == 0) {
+        throw HandlersException(std::format("Bad refresh token"), 
+            Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+    }
+
+    // Сравниваем ua и fingerprint
+    cmd.clear();
+    cmd << "HMGET" << std::format("rtk:{}", hashedRefreshToken) << "fingerprint" << "ua" << "user_id";
+    Poco::Redis::Array rtkFileds = redisClient_.execute<Poco::Redis::Array>(cmd);
+
+    // Удаляем hash refresh-токена из ZSET и HSET
+    Poco::UInt64 userId = std::stoull(rtkFileds.get<Poco::Redis::BulkString>(2).value());
+    deleteRefreshFromRedis(redisClient_, hashedRefreshToken, userId);
+    
+    if (rtkFileds.get<Poco::Redis::BulkString>(0).value() != fingerprint
+        or rtkFileds.get<Poco::Redis::BulkString>(1).value() != userAgent) 
+    {
+        throw HandlersException(std::format("Refresh token used from unauthorized device"), 
+            Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+    }
+
+    Poco::Data::Session session = sessionPool_.get();
+    Poco::Data::Statement stmt(session);
         
-        if (stmt.execute() == 0) 
-        {
-            res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
-            sendJsonResponse(res, "error", "Unknown internal server error");
-            return;
-        }
-
-        /**
-         * Формируем полезную нагрузку для access-токена
-         */
-        Devkit::Tokens::Payload jwtPayload =
-        {
-            .sub = userId,
-            .role = userRole,
-            .exp = std::chrono::duration_cast<std::chrono::seconds>((std::chrono::system_clock::now() + 
-                Auth::Handlers::access_token_validity_period).time_since_epoch())
-        };
-
-        /**
-         * Генерируем access и refresh токены
-         */
-        std::string accessToken = Auth::Handlers::createAccessToken(jwtPayload);
-        refreshToken = Auth::Handlers::createRefreshToken();
-
-        addRefreshToRedis(redisClient_, refreshToken, userId, fingerprint, userAgent);
-
-        Poco::JSON::Object resultJson;
-        resultJson.set("access_token", accessToken);
-        resultJson.set("refresh_token", refreshToken);
-
-        Poco::Net::HTTPCookie cookie("X-Refresh-token", refreshToken);
-        cookie.setHttpOnly(true);
-        cookie.setSecure(true);
-        cookie.setPath("/"); // TODO наверное не стоит делать /
-        cookie.setSameSite(Poco::Net::HTTPCookie::SAME_SITE_STRICT);
-
-        res.addCookie(cookie);
-
-        resultJson.stringify(res.send());
+    std::string userRole;
+    stmt << "SELECT role FROM users WHERE id = $1",
+        Poco::Data::Keywords::use(userId),
+        Poco::Data::Keywords::into(userRole);
+    
+    if (stmt.execute() == 0) {
+        throw HandlersException(std::format("Internal server error. Try repeating the request"), 
+            Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
     }
-    catch (const Poco::Exception& e)
+
+    // Формируем полезную нагрузку для access-токена
+    Devkit::Tokens::Payload jwtPayload =
     {
-        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-        sendJsonResponse(res, "error", e.displayText());
-        return;
-    }
-    catch (const std::exception& e)
-    {
-        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
-        sendJsonResponse(res, "error", e.what());
-        return;
-    }
-    catch (...)
-    {
-        res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
-        sendJsonResponse(res, "error", "Unknown internal server error");
-        return;
-    }
+        .sub = userId,
+        .role = userRole,
+        .exp = std::chrono::duration_cast<std::chrono::seconds>((std::chrono::system_clock::now() + 
+            Auth::Handlers::access_token_validity_period).time_since_epoch())
+    };
+
+    // Генерируем access и refresh токены
+    std::string accessToken = Auth::Handlers::createAccessToken(jwtPayload);
+    refreshToken = Auth::Handlers::createRefreshToken();
+
+    addRefreshToRedis(redisClient_, refreshToken, userId, fingerprint, userAgent);
+
+    Poco::JSON::Object resultJson;
+    resultJson.set("access_token", accessToken);
+    resultJson.set("refresh_token", refreshToken);
+
+    Poco::Net::HTTPCookie cookie("X-Refresh-token", refreshToken);
+    cookie.setHttpOnly(true);
+    cookie.setSecure(true);
+    cookie.setPath("/"); // TODO наверное не стоит делать /
+    cookie.setSameSite(Poco::Net::HTTPCookie::SAME_SITE_STRICT);
+
+    res.addCookie(cookie);
+
+    resultJson.stringify(res.send());
+}
+catch (const Auth::Handlers::HandlersException & e)
+{
+    res.setStatusAndReason(e.status());
+    sendJsonResponse(res, "error", e.what());
+}
+catch (...)
+{
+    res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+    sendJsonResponse(res, "error", "Internal server error");
 }
 
-void ErrorHandler::handleRequest(Poco::Net::HTTPServerRequest& req, Poco::Net::HTTPServerResponse& res)
+void ErrorHandler::handleRequest(Poco::Net::HTTPServerRequest & req, Poco::Net::HTTPServerResponse & res)
 {
-
+    res.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+    sendJsonResponse(res, "error", "Non-existent URL");
 }
 
 } // namespace FQW::Auth::Handlers

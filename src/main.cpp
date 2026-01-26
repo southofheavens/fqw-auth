@@ -51,11 +51,11 @@ private:
                 return new FQW::Auth::Handlers::RefreshHandler(sessionPool_, redisClient_);
             }
             else {
-                // ErrorHandler
+                return new FQW::Auth::Handlers::ErrorHandler();
             }
         }
         else {
-            // ErrorHandler
+            return new FQW::Auth::Handlers::ErrorHandler();
         }
     }
 
