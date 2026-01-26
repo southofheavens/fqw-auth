@@ -44,14 +44,19 @@ if poco_data_postgresql.found()
 endif
 
 src_files = [
-  'src/main.cpp',
-  'src/Handlers.cpp',
-  'src/Utils.cpp'
+  'src/app/main.cpp',
+  'src/platform/handlers/LoginHandler.cpp',
+  'src/platform/handlers/RefreshHandler.cpp',
+  'src/platform/handlers/RegisterHandler.cpp',
+  'src/platform/Utils.cpp',
+  'src/platform/AuthFactory.cpp',
+  'src/platform/AuthServer.cpp'
 ]
 
 include_dirs = [
   'src',
-  'subprojects'
+  'subprojects',
+  'src/platform'
 ]
 
 executable('fqw-auth',
