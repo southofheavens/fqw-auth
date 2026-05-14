@@ -8,7 +8,7 @@ namespace
 /// @brief Проверка удовлетворяет ли логин требованиям
 /// @param login логин
 /// @note Требования к логину:
-/// @note - обязан содержать буквы латинского алфавита и может содержать цифры
+/// @note - только буквы латинского алфавита и цифры; первый символ — буква
 /// @note - минимально допустимая длина - 3 символа
 /// @throw RGT::Devkit::RGTException если логин не удовлетворяет требованиям
 /// @details Логин чувствителен к регистру
@@ -19,6 +19,11 @@ void validateLogin(const std::string & login)
 
     if (login.length() < minimum_login_length) {
         throw RGT::Devkit::RGTException(std::format("The minimum login length is {} characters", minimum_login_length),
+            Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
+    }
+
+    if (not std::isalpha(static_cast<unsigned char>(login[0]))) {
+        throw RGT::Devkit::RGTException("The login must start with a letter",
             Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
     }
 
