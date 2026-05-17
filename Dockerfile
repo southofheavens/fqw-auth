@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.4
 FROM alpine:3.23.3
 
 RUN apk add --no-cache \
@@ -9,8 +10,6 @@ RUN apk add --no-cache \
     poco-dev \
     libsodium-dev \
     gtest-dev \
-    aws-sdk-cpp-dev \
-    aws-crt-cpp-dev \
     cmake \ 
     boost-dev
 
@@ -43,6 +42,9 @@ COPY . ./app
 COPY ./startup.config /etc/rgt-auth.config
 
 WORKDIR /app
+
+RUN rm -rf subprojects/rgt-devkit
+COPY --from=devkit . ./subprojects/rgt-devkit
 
 RUN meson build
 RUN meson compile -C build -j 1
